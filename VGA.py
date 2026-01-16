@@ -1,5 +1,4 @@
 import sys
-import uselect
 import machine
 from machine import Pin
 from rp2 import PIO, StateMachine, asm_pio
@@ -11,8 +10,11 @@ from math import sin, cos, pi
 from time import ticks_ms, ticks_diff, sleep_ms
 import select
 
-AVAILABLE_GPIOS = {16, 17, 18, 19, 20, 21}
-gpio_pins = {}
+ # GP0-2 used for RGB, GP4-5 for sync signals also used by PIO 
+
+# external control (GP16-GP21)
+AVAILABLE_GPIOS = {16, 17, 18, 19, 20, 21} 
+gpio_pins = {} 
 OVCLK = False
 
 def init_gpio(pin_num):
@@ -34,34 +36,55 @@ def gpio_control(pin_num, state):
 def set_freq(fclock: int) -> int:
     fc = int(fclock)
     if fc < 100_000_000 or fc > 250_000_000:
-        return -1
+        return -1  # Out of range
+
     post1: int = 6 if fc <= 130_000_000 else 3
     post2: int = 2
     fb: int = fc // 1_000_000 if fc <= 130_000_000 else fc // 2_000_000
-    p0 = ptr32(0x4002800c)
-    p1 = ptr32(0x40028008)
-    p0[0] = (int(post1) << 16) | (int(post2) << 12)
+    
+    # Write to hardware PLL registers
+    p0 = ptr32(0x4002800c)  # PLL config register 1
+    p1 = ptr32(0x40028008)  # PLL config register 2
+    p0[0] = (int(post1) << 16) | (int(post2) << 12) 
     p1[0] = int(fb)
-    return (int(fb) * 12) // (int(post1) * int(post2))
+    
+    return (int(fb) * 12) // (int(post1) * int(post2)) 
 
-mhz = set_freq(125_000_000)
-if mhz < 0:
-    print("Clock out of range (100-250MHz)")
+mhz = set_freq(125_000_000) 
+if mhz > 0:
+    print(f"CPU Speed: {mhz} MHz")
 else:
-    print("Clock:", mhz, "MHz")
+    print("ERROR: Frequency setting failed!")
 
 H_res = const(640)
 V_res = const(480)
-bit_per_pix = const(3)
-pixel_bitmask = const(0b111)
-usable_bits = const(30)
-pix_per_words = const(10)
+
+# Color system: 3-bit RGB (8 colors total: 2^3 = 8)
+BITS_PER_PIXEL = const(3)  # Bit0=Red, Bit1=Green, Bit2=Blue (1=ON, 0=OFF)
+PIXEL_BITMASK = const(0b111)  # 3-bit mask for extracting pixel data
+
+# Memory organization for Raspberry Pi Pico (32-bit architecture)
+USABLE_BITS = const(30)  # Use 30 bits per word (2 bits unused for alignment)
+PIXELS_PER_WORD = const(10)  # 30 bits / 3 bits = 10 pixels per word
+
+# Backward compatibility aliases
+bit_per_pix = BITS_PER_PIXEL
+pixel_bitmask = PIXEL_BITMASK  
+usable_bits = USABLE_BITS
+pix_per_words = PIXELS_PER_WORD
 
 if OVCLK:
-    set_freq(250000000)
-    SM0_FREQ, SM1_FREQ, SM2_FREQ = 12587500, 125000000, 113287500
+    # !!!!!! Overclocked mode (experimental - may be unstable!!!!!!! )
+    set_freq(250000000)  # Boost CPU to 250 MHz
+    SM0_FREQ = 125875000  # SM0: Horizontal sync frequency
+    SM1_FREQ = 125000000  # SM1: Vertical sync frequency
+    SM2_FREQ = 113287500  # SM2: RGB data frequency
 else:
-    SM0_FREQ, SM1_FREQ, SM2_FREQ = 25175000, 125000000, 100700000
+    # Normal mode (recommended - stable use this one if you love ur pico)
+    SM0_FREQ = 25175000   # 25.175 MHz - VGA pixel clock for 640x480@60Hz
+    SM1_FREQ = 125000000  # 125 MHz - Sync timing clock
+    SM2_FREQ = 100700000  # 100.7 MHz - RGB data output clock
+
 
 @asm_pio(set_init=PIO.OUT_HIGH, autopull=True, pull_thresh=32)
 def paral_Hsync():
@@ -76,7 +99,7 @@ def paral_Hsync():
     set(pins, 1) [13]
     irq(0)
     wrap()
-     
+
 paral_write_Hsync = StateMachine(0, paral_Hsync, freq=SM0_FREQ, set_base=Pin(4))
 
 @asm_pio(sideset_init=(PIO.OUT_HIGH,) * 1, autopull=True, pull_thresh=32)
@@ -92,231 +115,297 @@ def paral_Vsync():
     label("frontporch")
     wait(1, irq, 0)
     jmp(y_dec, "frontporch")
-    wait(1, irq, 0)              .side(0)
+    wait(1, irq, 0)     .side(0)
     wait(1, irq, 0)
     set(y, 31)
     label("backporch")
-    wait(1, irq, 0)              .side(1)
+    wait(1, irq, 0)     .side(1)
     jmp(y_dec, "backporch")
     wait(1, irq, 0)
     wrap()
- 
+
 paral_write_Vsync = StateMachine(1, paral_Vsync, freq=SM1_FREQ, sideset_base=Pin(5))
 
-@asm_pio(out_init=(PIO.OUT_LOW,) * 3, out_shiftdir=PIO.SHIFT_RIGHT, sideset_init=(PIO.OUT_LOW,) * 3, autopull=True, pull_thresh=usable_bits)
+@asm_pio(out_init=(PIO.OUT_LOW,) * 3, out_shiftdir=PIO.SHIFT_RIGHT, 
+         sideset_init=(PIO.OUT_LOW,) * 3, autopull=True, pull_thresh=usable_bits)
 def paral_RGB():
     pull(block)
     mov(y, osr)
     wrap_target()
-    mov(x, y)                  .side(0)
+    mov(x, y)           .side(0)
     wait(1, irq, 1)
     label("colorout")
     out(pins, 3)
-    nop()                      [1]
+    nop()               [1]
     jmp(x_dec, "colorout")
-    wrap()                   
-    
+    wrap()
+
 paral_write_RGB = StateMachine(2, paral_RGB, freq=SM2_FREQ, out_base=Pin(0), sideset_base=Pin(0))
 
+
+# DMA Channel 0 Registers
+DMA_CHANNEL_0_READ_ADDR = 0x50000000   # to read from
+DMA_CHANNEL_0_WRITE_ADDR = 0x50000004  # to write to
+DMA_CHANNEL_0_TRANS_COUNT = 0x50000008 # to transfer
+DMA_CHANNEL_0_CTRL = 0x50000010        # Control settings
+
+# DMA Channel 1 Registers
+DMA_CHANNEL_1_READ_ADDR = 0x50000040   # Source address
+DMA_CHANNEL_1_WRITE_ADDR = 0x50000044  # Destination address
+DMA_CHANNEL_1_TRANS_COUNT = 0x50000048 # to transfer
+DMA_CHANNEL_1_CTRL = 0x50000060        # Control register
+DMA_CHANNEL_1_READ_TRIGGER = 0x5000007c # for chaining
+
+# PIO and DMA Control Registers
+PIO_STATE_MACHINE_2_FIFO = 0x50200018  # PIO SM2 FIFO input queue
+DMA_ENABLE_REGISTER = 0x50000430       # DMA channels
+DMA_ABORT_REGISTER = 0x50000444        # stop for DMA
+PIO_ENABLE_REGISTER = 0x50200000       # PIO state machines
+
 @micropython.viper
-def configure_DMAs(nword:int, H_buffer_line_add:ptr32):
-    TREQ_SEL = 2
-    DMA_ctrl = (TREQ_SEL << 15) | (1 << 4) | (2 << 2) | (1 << 1) | 1
-    ptr32(0x50000040)[0] = 0
-    ptr32(0x50000044)[0] = uint(0x50200018)
-    ptr32(0x50000048)[0] = nword
-    ptr32(0x50000060)[0] = DMA_ctrl
-    TREQ_SEL = 0x3f
-    DMA_ctrl = (TREQ_SEL << 15) | (2 << 2) | (1 << 1) | 1
-    ptr32(0x50000000)[0] = uint(H_buffer_line_add)
-    ptr32(0x50000004)[0] = uint(0x5000007c)
-    ptr32(0x50000008)[0] = 1
-    ptr32(0x50000010)[0] = DMA_ctrl
+def configure_DMAs(nword: int, H_buffer_line_add: ptr32):
+    
+    # Channel 1: Transfer pixel data from frame buffer to PIO FIFO
+    transfer_request_source = 2  # Triggered by State Machine 2
+    enable_bit = 1  # Bit 0: Enable DMA
+    high_priority_bit = 1 << 1  # Bit 1: High priority (important for VGA timing!)
+    data_size_32bit = 2 << 2  # Bits 2-3: 32-bit transfer size
+    increment_read = 1 << 4  # Bit 4: Auto-increment read address
+    transfer_request = transfer_request_source << 15  # Bits 15-20: DREQ source
+    channel_1_control = transfer_request | increment_read | data_size_32bit | high_priority_bit | enable_bit
+    
+    ptr32(DMA_CHANNEL_1_READ_ADDR)[0] = 0  # Start address (updated by Channel 0)
+    ptr32(DMA_CHANNEL_1_WRITE_ADDR)[0] = uint(PIO_STATE_MACHINE_2_FIFO)  # Write to PIO
+    ptr32(DMA_CHANNEL_1_TRANS_COUNT)[0] = nword  # Total words to transfer
+    ptr32(DMA_CHANNEL_1_CTRL)[0] = channel_1_control  # Apply control settings
+    
+    # Channel 0: Continuously reload Channel 1's read address (infinite loop)
+    permanent_request = 0x3f  # 0x3f = TREQ_PERMANENT (no external trigger needed)
+    channel_0_control = (permanent_request << 15) | data_size_32bit | high_priority_bit | enable_bit
+    
+    ptr32(DMA_CHANNEL_0_READ_ADDR)[0] = uint(H_buffer_line_add)  # Frame buffer address
+    ptr32(DMA_CHANNEL_0_WRITE_ADDR)[0] = uint(DMA_CHANNEL_1_READ_TRIGGER)  # Trigger Channel 1
+    ptr32(DMA_CHANNEL_0_TRANS_COUNT)[0] = 1  # Transfer 1 word (the address)
+    ptr32(DMA_CHANNEL_0_CTRL)[0] = channel_0_control  # Apply control settings
+
 
 @micropython.viper
 def startsync():
-    V=int(ptr16(V_res))
-    H=int(ptr16(H_res))
-    paral_write_Hsync.put(655)
-    paral_write_Vsync.put(int(V-1))
-    paral_write_RGB.put(int(H-1))
-    ptr32(0x50000430)[0] |= 0b00001
-    ptr32(0x50200000)[0] |= 0b111
+    vertical_lines = int(ptr16(V_res))  # 480 lines
+    horizontal_pixels = int(ptr16(H_res))  # 640 pixels
+    
+    paral_write_Hsync.put(655)  # Horizontal timing 
+    paral_write_Vsync.put(int(vertical_lines - 1))  # 479
+    paral_write_RGB.put(int(horizontal_pixels - 1))  # 639
+    
+    ptr32(DMA_ENABLE_REGISTER)[0] |= 0b00001  # Enable DMA
+    ptr32(PIO_ENABLE_REGISTER)[0] |= 0b111
 
 @micropython.viper
 def stopsync():
-    ptr32(0x50000444)[0] |= 0b000011
-    ptr32(0x50200000)[0] &= 0b111111111000
+    ptr32(DMA_ABORT_REGISTER)[0] |= 0b000011  # Abort DMA channels 0 and 1
+    ptr32(PIO_ENABLE_REGISTER)[0] &= 0b111111111000  # clear bits 0,1,2
+
 
 @micropython.viper
-def draw_pix(x:int, y:int, col:int):
-    Data = ptr32(H_buffer_line)
-    n = int(y * (int(H_res) * int(bit_per_pix)) + x * int(bit_per_pix))
-    k = (n // int(usable_bits) - 1) if (n // int(usable_bits) > 0) else (int(len(H_buffer_line)) - 1)
-    p = n % int(usable_bits)
-    mask = ((int(pixel_bitmask) << p) ^ 0x3FFFFFFF)
-    Data[k] = (Data[k] & mask) | (col << p)
+def draw_pix(x: int, y: int, col: int):
+    buffer_data = ptr32(H_buffer_line)
+    total_bits = int(y * int(H_res) * int(BITS_PER_PIXEL) + x * int(BITS_PER_PIXEL))  # Bit position
+    word_index = total_bits // int(USABLE_BITS)
+    if word_index > 0:
+        word_index = word_index - 1
+    else:
+        word_index = int(len(H_buffer_line)) - 1
+    bit_position = total_bits % int(USABLE_BITS)  
+    pixel_clear_mask = ((int(PIXEL_BITMASK) << bit_position) ^ 0x3FFFFFFF) 
+    buffer_data[word_index] = (buffer_data[word_index] & pixel_clear_mask) | (col << bit_position)  # Clear old, set new color or texture
 
 @micropython.viper
-def fill_screen(col:int):
-    Data = ptr32(H_buffer_line)
-    mask = 0
-    for i in range(int(pix_per_words)):
-        mask |= col << (int(bit_per_pix) * i)
+def fill_screen(col: int):
+    buffer_data = ptr32(H_buffer_line)
+    color_pattern = 0  
+    for i in range(int(PIXELS_PER_WORD)):
+        color_pattern |= col << (int(BITS_PER_PIXEL) * i) 
     for i in range(int(len(H_buffer_line))):
-        Data[i] = mask
+        buffer_data[i] = color_pattern
 
 @micropython.viper
-def clear_region(x1:int, y1:int, x2:int, y2:int, col:int):
+def clear_region(x1: int, y1: int, x2: int, y2: int, col: int):
+
     if y1 > y2:
         y1, y2 = y2, y1
     for y in range(y1, y2):
-        draw_fastHline(x1, x2, y, col)
+        draw_fastHline(x1, x2, y, col)  # Fill each line
+
 
 @micropython.viper
-def draw_fastHline(x1:int,x2:int,y:int,col:int):
-    if x1<0:x1=0
-    if x1>=int(H_res):x1=int(H_res)-1
-    if x2<0:x2=0
-    if x2>=int(H_res):x2=int(H_res)-1
-    if y<0:y=0
-    if y>=int(V_res):y=int(V_res)-1
-    if x2<x1:
-        temp=x1
-        x1=x2
-        x2=temp
-    Data=ptr32(H_buffer_line)
-    n1=int(y*int(H_res)*int(bit_per_pix)+x1*int(bit_per_pix))
-    n2=int(y*int(H_res)*int(bit_per_pix)+x2*int(bit_per_pix))
-    k1=(n1//int(usable_bits)-1) if (n1//int(usable_bits)>0) else (int(len(H_buffer_line))-1)
-    k2=(n2//int(usable_bits)-1) if (n2//int(usable_bits)>0) else (int(len(H_buffer_line))-1)
-    if k2==k1:
-        for i in range(x1,x2):
-            draw_pix(i,y,col)
+def draw_fastHline(x1: int, x2: int, y: int, col: int):
+    if x1 < 0: x1 = 0
+    if x1 >= int(H_res): x1 = int(H_res) - 1
+    if x2 < 0: x2 = 0
+    if x2 >= int(H_res): x2 = int(H_res) - 1
+    if y < 0: y = 0
+    if y >= int(V_res): y = int(V_res) - 1
+    if x2 < x1:
+        x1, x2 = x2, x1
+    
+    Data = ptr32(H_buffer_line)
+    n1 = int(y * int(H_res) * int(bit_per_pix) + x1 * int(bit_per_pix))
+    n2 = int(y * int(H_res) * int(bit_per_pix) + x2 * int(bit_per_pix))
+    k1 = (n1 // int(usable_bits) - 1) if (n1 // int(usable_bits) > 0) else (int(len(H_buffer_line)) - 1)
+    k2 = (n2 // int(usable_bits) - 1) if (n2 // int(usable_bits) > 0) else (int(len(H_buffer_line)) - 1)
+    
+    if k2 == k1:
+        for i in range(x1, x2):
+            draw_pix(i, y, col)
         return
-    p1=n1%int(usable_bits)
-    p2=n2%int(usable_bits)
-    mask1off=0
-    mask1col=0
-    for i in range(p1//int(bit_per_pix),int(pix_per_words)):
-        mask1off|=int(pixel_bitmask)<<(int(bit_per_pix)*i)
-        mask1col|=col<<(int(bit_per_pix)*i)
-    mask1off^=0x3FFFFFFF
-    mask2off=0
-    mask2col=0
-    for i in range(0,p2//int(bit_per_pix)):
-        mask2off|=int(pixel_bitmask)<<(int(bit_per_pix)*i)
-        mask2col|=col<<(int(bit_per_pix)*i)
-    mask2off^=0x3FFFFFFF
-    Data[k1]=(Data[k1] & mask1off) | mask1col
-    Data[k2]=(Data[k2] & mask2off) | mask2col
-    mask=0
+    
+    p1 = n1 % int(usable_bits)
+    p2 = n2 % int(usable_bits)
+    mask1off = 0
+    mask1col = 0
+    for i in range(p1 // int(bit_per_pix), int(pix_per_words)):
+        mask1off |= int(pixel_bitmask) << (int(bit_per_pix) * i)
+        mask1col |= col << (int(bit_per_pix) * i)
+    mask1off ^= 0x3FFFFFFF
+    
+    mask2off = 0
+    mask2col = 0
+    for i in range(0, p2 // int(bit_per_pix)):
+        mask2off |= int(pixel_bitmask) << (int(bit_per_pix) * i)
+        mask2col |= col << (int(bit_per_pix) * i)
+    mask2off ^= 0x3FFFFFFF
+    
+    Data[k1] = (Data[k1] & mask1off) | mask1col
+    Data[k2] = (Data[k2] & mask2off) | mask2col
+    
+    mask = 0
     for i in range(int(pix_per_words)):
-        mask|=col<<(int(bit_per_pix)*i)
-    i=k1+1
-    if i>int(len(H_buffer_line))-1:
-        i=0
+        mask |= col << (int(bit_per_pix) * i)
+    
+    i = k1 + 1
+    if i > int(len(H_buffer_line)) - 1:
+        i = 0
     while i < k2:
-        Data[i]=mask
-        i+=1
+        Data[i] = mask
+        i += 1
+
 
 @micropython.viper
-def draw_fastVline(x:int,y1:int,y2:int,col:int):
-    if x<0:x=0
-    if x>=int(H_res):x=int(H_res)-1
-    if y1<0:y1=0
-    if y1>=int(V_res):y1=int(V_res)-1
-    if y2<0:y2=0
-    if y2>=int(V_res):y2=int(V_res)-1
-    if y2<y1:
-        temp=y1
-        y1=y2
-        y2=temp
-    Data=ptr32(H_buffer_line)
-    n1=int(y1*int(H_res)*int(bit_per_pix)+x*int(bit_per_pix))
-    k1=(n1//int(usable_bits)-1) if (n1//int(usable_bits)>0) else (int(len(H_buffer_line))-1)
-    p1=n1%int(usable_bits)
-    nword=int(len(H_buffer_line))//int(V_res)
-    mask=(int(pixel_bitmask)<<p1)^0x3FFFFFFF
-    for i in range(y2-y1):
-        Data[k1+i*nword]=(Data[k1+i*nword] & mask) | (col << p1)
+def draw_fastVline(x: int, y1: int, y2: int, col: int):
+    if x < 0: x = 0
+    if x >= int(H_res): x = int(H_res) - 1
+    if y1 < 0: y1 = 0
+    if y1 >= int(V_res): y1 = int(V_res) - 1
+    if y2 < 0: y2 = 0
+    if y2 >= int(V_res): y2 = int(V_res) - 1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    
+    Data = ptr32(H_buffer_line)
+    n1 = int(y1 * int(H_res) * int(bit_per_pix) + x * int(bit_per_pix))
+    k1 = (n1 // int(usable_bits) - 1) if (n1 // int(usable_bits) > 0) else (int(len(H_buffer_line)) - 1)
+    p1 = n1 % int(usable_bits)
+    nword = int(len(H_buffer_line)) // int(V_res)
+    mask = (int(pixel_bitmask) << p1) ^ 0x3FFFFFFF
+    for i in range(y2 - y1):
+        Data[k1 + i * nword] = (Data[k1 + i * nword] & mask) | (col << p1)
 
 @micropython.viper
-def fill_rect(x1:int,y1:int,x2:int,y2:int,col:int):
-    y_min=y1 if y1<y2 else y2
-    y_max=y1 if y1>y2 else y2
-    j=y_min
-    while j<y_max:
-        draw_fastHline(x1,x2,j,col)
-        j+=1
+def fill_rect(x1: int, y1: int, x2: int, y2: int, col: int):
+    y_min = y1 if y1 < y2 else y2
+    y_max = y1 if y1 > y2 else y2
+    j = y_min
+    while j < y_max:
+        draw_fastHline(x1, x2, j, col)
+        j += 1
 
 @micropython.viper
-def draw_rect(x1:int,y1:int,x2:int,y2:int,col:int):
-    draw_fastHline(x1,x2,y1,col)
-    draw_fastHline(x1,x2,y2,col)
-    draw_fastVline(x1,y1,y2,col)
-    draw_fastVline(x2,y1,y2,col)
+def draw_rect(x1: int, y1: int, x2: int, y2: int, col: int):
+    draw_fastHline(x1, x2, y1, col)
+    draw_fastHline(x1, x2, y2, col)
+    draw_fastVline(x1, y1, y2, col)
+    draw_fastVline(x2, y1, y2, col)
 
 @micropython.viper
-def draw_circle(x:int, y:int, r:int , color:int):
-    if x<0 or y<0 or x>=int(H_res) or y>=int(V_res):
+def draw_circle(x: int, y: int, r: int, color: int):
+    if x < 0 or y < 0 or x >= int(H_res) or y >= int(V_res):
         return
-    x_pos=-r
-    y_pos=0
-    err=2-2*r
+    x_pos = -r
+    y_pos = 0
+    err = 2 - 2 * r
     while 1:
-        draw_pix(x-x_pos,y+y_pos,color)
-        draw_pix(x-x_pos,y-y_pos,color)
-        draw_pix(x+x_pos,y+y_pos,color)
-        draw_pix(x+x_pos,y-y_pos,color)
-        e2=err
-        if e2<=y_pos:
-            y_pos+=1
-            err+=y_pos*2+1
-            if -x_pos==y_pos and e2<=x_pos:
-                e2=0
-        if e2>x_pos:
-            x_pos+=1
-            err+=x_pos*2+1
-        if x_pos>0:
+        draw_pix(x - x_pos, y + y_pos, color)
+        draw_pix(x - x_pos, y - y_pos, color)
+        draw_pix(x + x_pos, y + y_pos, color)
+        draw_pix(x + x_pos, y - y_pos, color)
+        e2 = err
+        if e2 <= y_pos:
+            y_pos += 1
+            err += y_pos * 2 + 1
+            if -x_pos == y_pos and e2 <= x_pos:
+                e2 = 0
+        if e2 > x_pos:
+            x_pos += 1
+            err += x_pos * 2 + 1
+        if x_pos > 0:
             break
 
 @micropython.viper
-def fill_disk(x:int, y:int, r:int , color:int):
-    if x<0 or y<0 or x>=int(H_res) or y>=int(V_res):
+def fill_disk(x: int, y: int, r: int, color: int):
+    if x < 0 or y < 0 or x >= int(H_res) or y >= int(V_res):
         return
-    x_pos=-r
-    y_pos=0
-    err=2-2*r
+    x_pos = -r
+    y_pos = 0
+    err = 2 - 2 * r
     while 1:
-        draw_fastHline(x-x_pos,x+x_pos,y+y_pos,color)
-        draw_fastHline(x-x_pos,x+x_pos,y-y_pos,color)
-        e2=err
-        if e2<=y_pos:
-            y_pos+=1
-            err+=y_pos*2+1
-            if -x_pos==y_pos and e2<=x_pos:
-                e2=0
-        if e2>x_pos:
-            x_pos+=1
-            err+=x_pos*2+1
-        if x_pos>0:
+        draw_fastHline(x - x_pos, x + x_pos, y + y_pos, color)
+        draw_fastHline(x - x_pos, x + x_pos, y - y_pos, color)
+        e2 = err
+        if e2 <= y_pos:
+            y_pos += 1
+            err += y_pos * 2 + 1
+            if -x_pos == y_pos and e2 <= x_pos:
+                e2 = 0
+        if e2 > x_pos:
+            x_pos += 1
+            err += x_pos * 2 + 1
+        if x_pos > 0:
             break
 
-collect()
+
+collect()  # Run garbage collector to free memory 
 mem_before = mem_free()
-visible_pix = int((H_res) * V_res * bit_per_pix / usable_bits)
-H_buffer_line = array('L', (0 for _ in range(visible_pix)))
-H_buffer_line_address = array('L', [addressof(H_buffer_line)])
 
-print(f"Buffer: {(mem_before - mem_free()) / 1024:.1f}KB | RAM: {mem_free() / 1024:.1f}KB")
-collect()
+print("\n--- Frame Buffer Setup ---")
+print(f"Screen: {H_res}x{V_res} = {H_res * V_res} pixels")
+print(f"Each pixel: {BITS_PER_PIXEL} bits ({2**BITS_PER_PIXEL} colors)")
+print(f"Total: {H_res * V_res * BITS_PER_PIXEL} bits")
+print(f"Per word: {PIXELS_PER_WORD} pixels ({USABLE_BITS} bits)")
 
+total_pixels = int(H_res * V_res * BITS_PER_PIXEL / USABLE_BITS)
+print(f"Required: {total_pixels} words")
 
-RED, GREEN, BLUE = 0b001, 0b010, 0b100
-YELLOW, CYAN, MAGENTA = 0b011, 0b110, 0b101
-BLACK, WHITE = 0, 0b111
+H_buffer_line = array('L', (0 for _ in range(total_pixels)))  # Allocate array
+H_buffer_line_address = array('L', [addressof(H_buffer_line)])  # Get memory address for DMA
 
+mem_used = (mem_before - mem_free()) / 1024  # Calculate KB used
+mem_remaining = mem_free() / 1024
+print(f"\nFrame Buffer: {mem_used:.1f} KB used")
+print(f"RAM Remaining: {mem_remaining:.1f} KB\n")
+
+collect() # Run garbage collector to free memory again :p
+
+RED     = 0b001  # 1: Red only
+GREEN   = 0b010  # 2: Green only
+BLUE    = 0b100  # 4: Blue only
+YELLOW  = 0b011  # 3: Red + Green
+CYAN    = 0b110  # 6: Green + Blue
+MAGENTA = 0b101  # 5: Red + Blue
+BLACK   = 0b000  # 0: All off
+WHITE   = 0b111  # 7: All on
+
+# Each character is 5 bytes wide, each byte represents a column of 8 pixels (LSB at top)
 FONT_5X7 = {
     ' ': [0x00, 0x00, 0x00, 0x00, 0x00],
     '!': [0x00, 0x00, 0x5F, 0x00, 0x00],
@@ -415,13 +504,22 @@ FONT_5X7 = {
     '~': [0x08, 0x04, 0x08, 0x10, 0x08],
 }
 
+
+
 def draw_char(x, y, char, color, scale=1):
+
     if char not in FONT_5X7:
         return
+        
     bitmap = FONT_5X7[char]
+    
+    # Iterate through each column of the character
     for col in range(5):
+        # Iterate through each row
         for row in range(8):
+            # Check if pixel is set in bitmap
             if bitmap[col] & (1 << row):
+                # Draw scaled pixel
                 for sx in range(scale):
                     for sy in range(scale):
                         px = x + col * scale + sx
@@ -429,32 +527,39 @@ def draw_char(x, y, char, color, scale=1):
                         if 0 <= px < H_res and 0 <= py < V_res:
                             draw_pix(px, py, color)
 
+
 def draw_text(x, y, text, color, scale=1):
-    cx = x
+
+    cx = x  # Current X position
+    
     for char in text:
         if char == '\n':
+            # Move to next line
             y += 8 * scale + 2 * scale
             cx = x
         else:
+            # Draw character and advance cursor
             draw_char(cx, y, char, color, scale)
-            cx += 6 * scale
+            cx += 6 * scale  # 5 pixels + 1 spacing
 
+
+# 3D Matrix
 class Matrix3D:
     @staticmethod
     def rotate_x(angle):
-        c = cos(angle)
-        s = sin(angle)
+        c, s = cos(angle), sin(angle)
         return [[1, 0, 0], [0, c, -s], [0, s, c]]
+    
     @staticmethod
     def rotate_y(angle):
-        c = cos(angle)
-        s = sin(angle)
+        c, s = cos(angle), sin(angle)
         return [[c, 0, s], [0, 1, 0], [-s, 0, c]]
+    
     @staticmethod
     def rotate_z(angle):
-        c = cos(angle)
-        s = sin(angle)
+        c, s = cos(angle), sin(angle)
         return [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+    
     @staticmethod
     def multiply(m1, m2):
         result = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
@@ -463,6 +568,7 @@ class Matrix3D:
                 for k in range(3):
                     result[i][j] += m1[i][k] * m2[k][j]
         return result
+    
     @staticmethod
     def transform(matrix, point):
         x, y, z = point
@@ -479,8 +585,7 @@ def project_3d(x, y, z, distance=4):
     return screen_x, screen_y
 
 def draw_line(x1, y1, x2, y2, color):
-    dx = abs(x2 - x1)
-    dy = abs(y2 - y1)
+    dx, dy = abs(x2 - x1), abs(y2 - y1)
     sx = 1 if x1 < x2 else -1
     sy = 1 if y1 < y2 else -1
     err = dx - dy
@@ -521,41 +626,39 @@ def fill_triangle(x1, y1, x2, y2, x3, y3, color):
         xb = max(0, min(H_res - 1, xb))
         draw_fastHline(xa, xb, y, color)
 
+
+
+# 3D Cube
 class Cube3D:
     def __init__(self):
         self.vertices = [
             [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
-            [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]
+            [-1, -1, 1],  [1, -1, 1],  [1, 1, 1],  [-1, 1, 1]
         ]
         self.faces = [
-            ([0, 1, 2, 3], RED),
-            ([4, 5, 6, 7], GREEN),
-            ([0, 1, 5, 4], BLUE),
-            ([2, 3, 7, 6], YELLOW),
-            ([0, 3, 7, 4], MAGENTA),
-            ([1, 2, 6, 5], CYAN)
+            ([0, 1, 2, 3], RED), ([4, 5, 6, 7], GREEN), ([0, 1, 5, 4], BLUE),
+            ([2, 3, 7, 6], YELLOW), ([0, 3, 7, 4], MAGENTA), ([1, 2, 6, 5], CYAN)
         ]
         self.edges = [
-            (0, 1), (1, 2), (2, 3), (3, 0),
-            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
             (0, 4), (1, 5), (2, 6), (3, 7)
         ]
         self.angle_x = 0
         self.angle_y = 0
         self.angle_z = 0
+    
     def rotate(self, dx, dy, dz):
         self.angle_x += dx
         self.angle_y += dy
         self.angle_z += dz
+    
     def draw(self, filled=True):
         rx = Matrix3D.rotate_x(self.angle_x)
         ry = Matrix3D.rotate_y(self.angle_y)
         rz = Matrix3D.rotate_z(self.angle_z)
         rotation = Matrix3D.multiply(Matrix3D.multiply(rx, ry), rz)
-        transformed = []
-        for vertex in self.vertices:
-            rotated = Matrix3D.transform(rotation, vertex)
-            transformed.append(rotated)
+        transformed = [Matrix3D.transform(rotation, v) for v in self.vertices]
+        
         if filled:
             face_depths = []
             for face_indices, color in self.faces:
@@ -571,9 +674,15 @@ class Cube3D:
         else:
             projected = [project_3d(*v) for v in transformed]
             for edge in self.edges:
-                p1 = projected[edge[0]]
-                p2 = projected[edge[1]]
+                p1, p2 = projected[edge[0]], projected[edge[1]]
                 draw_line(p1[0], p1[1], p2[0], p2[1], WHITE)
+
+
+
+# Terminal settings
+TERM_X, TERM_Y = 440, 10
+TERM_WIDTH, TERM_HEIGHT = 190, 460
+TERM_MAX_LINES = 28
 
 text_buffer = []
 command_history = []
@@ -582,12 +691,6 @@ previous_mode = "demo"
 cube = Cube3D()
 mode_changed = False
 show_terminal = True
-
-TERM_X = 440
-TERM_Y = 10
-TERM_WIDTH = 190
-TERM_HEIGHT = 460
-TERM_MAX_LINES = 28
 
 def add_to_terminal(message, color=WHITE):
     global command_history
@@ -610,10 +713,15 @@ def draw_terminal():
         draw_text(TERM_X, y_pos, msg, color, 1)
         y_pos += 15
 
+
+
+# Write command processor
 def process_command(cmd):
     global current_mode, text_buffer, mode_changed, previous_mode, show_terminal
     original_cmd = cmd.strip()
     cmd_upper = cmd.strip().upper()
+    
+    # for GPIO
     if cmd_upper.startswith("GPIO ") or cmd_upper.startswith("GP"):
         parts = cmd_upper.replace("GPIO", "GP").split()
         if len(parts) >= 2:
@@ -625,6 +733,7 @@ def process_command(cmd):
                 else:
                     state_str = parts[1] if len(parts) > 1 else ""
                 pin_num = int(pin_str)
+                
                 if state_str in ["ON", "1", "HIGH"]:
                     success, msg = gpio_control(pin_num, True)
                     if current_mode == "text":
@@ -649,6 +758,8 @@ def process_command(cmd):
                     add_to_terminal(f"> {original_cmd}", CYAN)
                     add_to_terminal(msg, RED)
                 return msg
+    
+    # For color
     elif cmd_upper == "BLUE":
         previous_mode = current_mode
         current_mode = "static"
@@ -656,7 +767,8 @@ def process_command(cmd):
         fill_screen(BLUE)
         draw_text(10, 10, "BLUE MODE", WHITE, 2)
         draw_text(10, 40, "Type DEMO to return", CYAN, 1)
-        return "Switched to BLUE background"
+        return "Switched to BLUE"
+    
     elif cmd_upper == "RED":
         previous_mode = current_mode
         current_mode = "static"
@@ -664,7 +776,8 @@ def process_command(cmd):
         fill_screen(RED)
         draw_text(10, 10, "RED MODE", WHITE, 2)
         draw_text(10, 40, "Type DEMO to return", CYAN, 1)
-        return "Switched to RED background"
+        return "Switched to RED"
+    
     elif cmd_upper == "GREEN":
         previous_mode = current_mode
         current_mode = "static"
@@ -672,7 +785,8 @@ def process_command(cmd):
         fill_screen(GREEN)
         draw_text(10, 10, "GREEN MODE", WHITE, 2)
         draw_text(10, 40, "Type DEMO to return", CYAN, 1)
-        return "Switched to GREEN background"
+        return "Switched to GREEN"
+    
     elif cmd_upper == "MULTICOLOUR" or cmd_upper == "MULTICOLOR":
         previous_mode = current_mode
         current_mode = "static"
@@ -680,17 +794,19 @@ def process_command(cmd):
         for h in range(8):
             for i in range(60):
                 for k in range(8):
-                    col = (h + k) % 8
-                    draw_fastHline(k * 80, k * 80 + 80, h * 60 + i, col)
-        draw_text(10, 10, "MULTICOLOUR MODE", BLACK, 2)
+                    draw_fastHline(k * 80, k * 80 + 80, h * 60 + i, (h + k) % 8)
+        draw_text(10, 10, "MULTICOLOUR", BLACK, 2)
         draw_text(10, 40, "Type DEMO to return", WHITE, 1)
-        return "Switched to MULTICOLOUR pattern"
+        return "Switched to MULTICOLOUR"
+    
+    # For Mode selection
     elif cmd_upper == "DEMO":
         previous_mode = current_mode
         current_mode = "demo"
         mode_changed = True
         fill_screen(BLACK)
         return "Starting 3D cube demo"
+    
     elif cmd_upper == "TEXT":
         previous_mode = current_mode
         current_mode = "text"
@@ -701,13 +817,16 @@ def process_command(cmd):
         add_to_terminal("TEXT MODE", GREEN)
         add_to_terminal("Type anything", CYAN)
         add_to_terminal("GPIO commands work", CYAN)
-        return "TEXT mode - command prompt style"
+        return "TEXT mode"
+    
+    # for healper commands
     elif cmd_upper == "CLEAR":
         if current_mode == "text":
             command_history.clear()
             text_buffer = []
             add_to_terminal("Terminal cleared", GREEN)
         return "Terminal cleared"
+    
     elif cmd_upper == "HELP":
         if current_mode == "text":
             add_to_terminal(f"> {original_cmd}", CYAN)
@@ -729,6 +848,7 @@ def process_command(cmd):
             draw_text(10, 100, "GPIO <16-21> ON/OFF", CYAN, 1)
             draw_text(10, 115, "STATUS, CLEAR, HELP", CYAN, 1)
         return "Help displayed"
+    
     elif cmd_upper == "STATUS":
         if current_mode == "text":
             add_to_terminal(f"> {original_cmd}", CYAN)
@@ -741,28 +861,30 @@ def process_command(cmd):
                 else:
                     add_to_terminal(f"GP{pin}: INIT", WHITE)
         return "Status displayed"
+    
     else:
         if current_mode == "text" and original_cmd:
             add_to_terminal(f"> {original_cmd}", WHITE)
-            return None
         return None
 
 def read_serial_input():
     if select.select([sys.stdin], [], [], 0)[0]:
-        line = sys.stdin.readline().strip()
-        return line
+        return sys.stdin.readline().strip()
     return None
 
+# loop main program
 def main_loop():
     global current_mode, text_buffer, mode_changed
     print("VGA Ready | GPIO: 16-21 | Type HELP")
     fill_screen(BLACK)
+    
     while True:
         user_input = read_serial_input()
         if user_input:
             result = process_command(user_input)
             if result:
                 print(result)
+        
         if current_mode == "demo":
             t = ticks_ms()
             if mode_changed:
@@ -775,15 +897,18 @@ def main_loop():
             elapsed = ticks_diff(ticks_ms(), t)
             if elapsed < 33:
                 sleep_ms(33 - elapsed)
+        
         elif current_mode == "text":
             if mode_changed:
                 fill_screen(BLACK)
                 mode_changed = False
             draw_terminal()
             sleep_ms(50)
+        
         elif current_mode == "static":
             sleep_ms(100)
 
+# Run n Run
 configure_DMAs(len(H_buffer_line), H_buffer_line_address)
 startsync()
 fill_screen(BLACK)
