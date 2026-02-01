@@ -26,13 +26,6 @@ VGA output library for Raspberry Pi Pico using PIO state machines and DMA.
 <img width="1362" height="661" alt="Ekran görüntüsü 2025-10-23 221937" src="https://github.com/user-attachments/assets/09aea598-941e-4abe-b7b5-8a2d751268f6" />
 
 
-
-https://github.com/user-attachments/assets/1c7bba68-1e3c-47c9-b2b4-7759eed3f4d5
-
-
-https://github.com/user-attachments/assets/eb876ddb-2cf8-4164-84c0-fa674099fab2
-
-
 ### Serial Commands
 
 Connect via USB serial terminal (115200 baud):
